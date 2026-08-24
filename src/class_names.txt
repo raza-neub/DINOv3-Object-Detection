@@ -1,0 +1,16 @@
+bicycle
+bus
+car
+motorcycle
+person
+scooter
+truck
+bollard
+traffic_light_red
+neubie
+warning_light
+ev_close
+ev_open
+cart
+traffic_light_green
+traffic_light_other
