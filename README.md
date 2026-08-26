@@ -2,6 +2,9 @@
 
 Anchor-free FCOS-style object detection heads trained on top of **frozen DINOv3** backbones (ViT-S/16+ and ConvNeXt). Designed for deployment via ONNX/TensorRT on Jetson Orin.
 
+## To do:
+1. Reproducibility checks!
+
 ## Pipelines
 
 | Pipeline | Backbone | FPN Levels | Key Feature |
