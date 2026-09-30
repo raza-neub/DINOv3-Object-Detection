@@ -36,15 +36,95 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from src.blocks import (
+from src.model_head_v2 import (
     ConvGNReLU,
     DWSConvGNReLU,
     RepDWSBlock,
     SmallObjectRefine,
     count_parameters,
 )
-from src.head_vitsplus_mix import DetectHeadMix
-from src.head_vitsplus_mix_p2 import AIFIEncoder, AuxDecoderHead
+from src.model_head_mix import DetectHeadMix
+from src.model_head_mix_p2 import AIFIEncoder, AuxDecoderHead
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FreqEnhance: Difference-of-Gaussians frequency band enhancement
+# ──────────────────────────────────────────────────────────────────────────────
+
+class FreqEnhance(nn.Module):
+    """Per-level frequency-band feature enhancement via Difference of Gaussians.
+
+    Decomposes each FPN feature map into three frequency bands (low / mid / high),
+    processes each through a lightweight depthwise conv, and fuses them with
+    learnable scalar weights + a residual connection.
+
+    Inspired by SFDNet (ECCV 2026) — simplified: no Mamba SSM, just DoG + DWConv.
+
+    Parameters
+    ----------
+    channels : FPN channel count
+    sigma_low  : Gaussian sigma for the low-pass filter (larger = smoother)
+    sigma_high : Gaussian sigma for the high-pass boundary (smaller = finer)
+    kernel_size: Gaussian blur kernel size (must be odd)
+    """
+
+    def __init__(self, channels: int, sigma_low: float = 2.0,
+                 sigma_high: float = 1.0, kernel_size: int = 5):
+        super().__init__()
+        assert kernel_size % 2 == 1
+        self.channels = channels
+
+        # Fixed Gaussian kernels (not learned — band boundaries are stable)
+        self.register_buffer('_gauss_low',
+                             self._make_gauss_kernel(channels, kernel_size, sigma_low))
+        self.register_buffer('_gauss_high',
+                             self._make_gauss_kernel(channels, kernel_size, sigma_high))
+        self.pad = kernel_size // 2
+
+        # Per-band 3×3 depthwise conv (cheap, learns band-specific refinement)
+        self.conv_low  = nn.Conv2d(channels, channels, 3, padding=1,
+                                   groups=channels, bias=False)
+        self.conv_mid  = nn.Conv2d(channels, channels, 3, padding=1,
+                                   groups=channels, bias=False)
+        self.conv_high = nn.Conv2d(channels, channels, 3, padding=1,
+                                   groups=channels, bias=False)
+
+        # Learnable per-band scalar weights (init: equal contribution)
+        self.alpha = nn.Parameter(torch.tensor(1.0 / 3))  # low
+        self.beta  = nn.Parameter(torch.tensor(1.0 / 3))  # mid
+        self.gamma = nn.Parameter(torch.tensor(1.0 / 3))  # high
+
+        # GroupNorm after fusion
+        g = min(16, channels)
+        while channels % g != 0 and g > 1:
+            g -= 1
+        self.norm = nn.GroupNorm(g, channels)
+
+    @staticmethod
+    def _make_gauss_kernel(channels: int, ks: int, sigma: float) -> torch.Tensor:
+        """Create a grouped 2D Gaussian blur kernel (one kernel per channel)."""
+        ax = torch.arange(ks, dtype=torch.float32) - ks // 2
+        g1d = torch.exp(-ax.pow(2) / (2 * sigma ** 2))
+        g1d = g1d / g1d.sum()
+        g2d = g1d.unsqueeze(1) * g1d.unsqueeze(0)  # (ks, ks)
+        # Grouped conv kernel: (C_out, C_in/groups, kH, kW) with groups=C
+        return g2d.unsqueeze(0).unsqueeze(0).expand(channels, 1, ks, ks).contiguous()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Gaussian blurs (depthwise grouped conv with fixed kernels)
+        x_blur_low  = F.conv2d(x, self._gauss_low,  padding=self.pad, groups=self.channels)
+        x_blur_high = F.conv2d(x, self._gauss_high, padding=self.pad, groups=self.channels)
+
+        # Frequency band decomposition
+        p_low  = x_blur_low                     # smooth / large-scale
+        p_mid  = x_blur_high - x_blur_low       # mid-frequency
+        p_high = x - x_blur_high                # fine detail / edges
+
+        # Per-band refinement + weighted fusion + residual
+        fused = (self.alpha * self.conv_low(p_low) +
+                 self.beta  * self.conv_mid(p_mid) +
+                 self.gamma * self.conv_high(p_high))
+        return self.norm(fused) + x
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -217,12 +297,21 @@ class ConvNeXtDetectionHeadMixP2(nn.Module):
                  use_dcn: bool = False,
                  use_aux_decoder: bool = False,
                  aux_num_queries: int = 100,
-                 aux_decoder_layers: int = 2):
+                 aux_decoder_layers: int = 2,
+                 use_freq_enhance: bool = False,
+                 use_cross_level_attn: bool = False):
         super().__init__()
         self.num_levels = 4
         self.fpn = ConvNeXtEfficientPAN(
             in_channels_list, out_channels=fpn_channels,
             use_aifi=use_aifi, aifi_layers=aifi_layers, aifi_heads=aifi_heads)
+
+        # DoG frequency-band enhancement on each FPN level (SFDNet-inspired)
+        self.use_freq_enhance = use_freq_enhance
+        if use_freq_enhance:
+            self.freq_enhance = nn.ModuleList([
+                FreqEnhance(fpn_channels) for _ in range(4)])
+
         self.head = DetectHeadMix(
             in_channels=fpn_channels,
             num_coco_classes=num_coco_classes,
@@ -238,6 +327,7 @@ class ConvNeXtDetectionHeadMixP2(nn.Module):
             reg_max=reg_max,
             use_centerness=use_centerness,
             use_dcn=use_dcn,
+            use_cross_level_attn=use_cross_level_attn,
         )
         self.use_aux_decoder = use_aux_decoder
         if use_aux_decoder:
@@ -247,9 +337,13 @@ class ConvNeXtDetectionHeadMixP2(nn.Module):
             )
 
     def forward(self, features: List[torch.Tensor],
-                dataset: str = 'neubie') -> Dict:
+                dataset: str = 'neubie',
+                return_cls_feat: bool = False) -> Dict:
         fpn_out = self.fpn(features)
-        head_out = self.head(fpn_out, dataset=dataset)
+        if self.use_freq_enhance:
+            fpn_out = [self.freq_enhance[i](f) for i, f in enumerate(fpn_out)]
+        head_out = self.head(fpn_out, dataset=dataset,
+                             return_cls_feat=return_cls_feat)
         if self.training and self.use_aux_decoder:
             head_out['aux'] = self.aux_decoder(fpn_out)
         return head_out

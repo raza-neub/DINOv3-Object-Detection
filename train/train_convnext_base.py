@@ -456,6 +456,23 @@ def main():
                    help='Number of calibration fine-tuning epochs')
     p.add_argument('--calibrate-lr',     type=float, default=5e-4,
                    help='Peak LR for calibration fine-tuning')
+    # Strategy 1: Fast full-head+FPN fine-tuning (10-20 epochs)
+    # Unfreezes FPN + all heads (backbone stays frozen), VFL_Q_FLOOR=0.0,
+    # lower LR with cosine decay, Neubie-only data, optional cls loss boost
+    p.add_argument('--finetune',         action='store_true',
+                   help='Fast fine-tune: unfreeze FPN+heads, VFL_Q_FLOOR=0.0, low LR')
+    p.add_argument('--finetune-epochs',  type=int, default=15,
+                   help='Number of fine-tuning epochs')
+    p.add_argument('--finetune-lr',      type=float, default=1e-4,
+                   help='Peak LR for fine-tuning (all param groups)')
+    p.add_argument('--cls-loss-scale',   type=float, default=1.5,
+                   help='Scale cls loss weight during fine-tuning (prioritize score fix)')
+    p.add_argument('--reg-loss-scale',   type=float, default=0.5,
+                   help='Scale reg loss weight during fine-tuning (deprioritize box refinement)')
+    p.add_argument('--gpus',             type=str, default='',
+                   help='Comma-separated GPU ids for DataParallel (e.g. "1,2")')
+    p.add_argument('--trt-head',         action='store_true',
+                   help='Use TRT-exportable head (GN preserved, DCN replaced with DilatedConv)')
     args = p.parse_args()
 
     torch.backends.cudnn.benchmark = True
@@ -473,14 +490,24 @@ def main():
 
     from src.dataset         import DatasetCOCOv3
     from src.backbone_convnext import DinoBackboneConvNeXt
-    from src.head_convnext     import ConvNeXtDetectionHeadMixP2
+    if args.trt_head:
+        from src.head_convnext_trt import ConvNeXtDetectionHeadMixP2
+        print('[TRT-HEAD] Using TRT-clean head (BN, no DCN)')
+    else:
+        from src.head_convnext     import ConvNeXtDetectionHeadMixP2
     from src.loss                 import compute_loss
     from src.decode               import decode_outputs_OBB
     from collate_fn                  import collate_fn
 
-    device = (torch.device(args.device) if args.device
-              else torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-    print('Using device:', device)
+    # Multi-GPU: --gpus "1,2" uses DataParallel across those GPUs
+    gpu_ids = [int(g) for g in args.gpus.split(',') if g.strip()] if args.gpus else []
+    if gpu_ids:
+        device = torch.device(f'cuda:{gpu_ids[0]}')
+        print(f'Using DataParallel on GPUs: {gpu_ids}  (primary={device})')
+    else:
+        device = (torch.device(args.device) if args.device
+                  else torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+        print('Using device:', device)
 
     cfg_use_amp = bool(getattr(cfg, 'USE_AMP', False))
     use_amp     = (args.use_amp or cfg_use_amp) and device.type == 'cuda'
@@ -539,8 +566,8 @@ def main():
     VAL_NMS_THRESH    = float(getattr(cfg, 'VAL_NMS_THRESH', 0.6))
     VAL_RARE_THRESH   = float(getattr(cfg, 'VAL_RARE_THRESH', 0.08))
     VAL_METRIC_EVERY  = int(getattr(cfg, 'VAL_METRIC_EVERY', 1))
-    # In calibration mode, always compute full metrics (only ~20 epochs)
-    if args.calibrate:
+    # In calibration/finetune mode, always compute full metrics (only ~15-20 epochs)
+    if args.calibrate or args.finetune:
         VAL_METRIC_EVERY = 1
 
     # Phase C architectural knobs
@@ -558,6 +585,20 @@ def main():
 
     # ConvNeXt-specific config
     CONVNEXT_IN_CHANNELS = list(getattr(cfg, 'CONVNEXT_IN_CHANNELS', [192, 384, 768]))
+
+    # Phase D: SFDNet/RT-SFOD improvements
+    USE_FREQ_ENHANCE  = bool(getattr(cfg, 'USE_FREQ_ENHANCE', False))
+    VAR_REG_WEIGHT    = float(getattr(cfg, 'VAR_REG_WEIGHT', 0.0))
+    CPD_WEIGHT        = float(getattr(cfg, 'CPD_WEIGHT', 0.0))
+    CPD_WARMUP_EPOCHS = int(getattr(cfg, 'CPD_WARMUP_EPOCHS', 10))
+    CPD_MOMENTUM      = float(getattr(cfg, 'CPD_MOMENTUM', 0.9))
+    CPD_TEMPERATURE   = float(getattr(cfg, 'CPD_TEMPERATURE', 0.07))
+
+    # Phase E: Head architecture overhaul
+    COSINE_CLS          = bool(getattr(cfg, 'COSINE_CLS', True))
+    FOCAL_WARMUP_EPOCHS = int(getattr(cfg, 'FOCAL_WARMUP_EPOCHS', 0))
+    TAL_ALPHA_SCHEDULE  = bool(getattr(cfg, 'TAL_ALPHA_SCHEDULE', False))
+    USE_CROSS_LEVEL_ATTN = bool(getattr(cfg, 'USE_CROSS_LEVEL_ATTN', False))
 
     def _worker_init_fn(worker_id):
         """Seed each worker differently so augmentations vary across workers."""
@@ -679,6 +720,7 @@ def main():
         num_neubie_classes=actual_neubie_classes,
         num_convs=N_CONVS,
         obb=USE_OBB,
+        cosine_cls=COSINE_CLS,
         # Phase C
         use_aifi=USE_AIFI,
         aifi_layers=AIFI_LAYERS,
@@ -689,12 +731,21 @@ def main():
         use_aux_decoder=USE_AUX_DECODER,
         aux_num_queries=AUX_NUM_QUERIES,
         aux_decoder_layers=AUX_DECODER_LAYERS,
+        # Phase D
+        use_freq_enhance=USE_FREQ_ENHANCE,
+        # Phase E
+        use_cross_level_attn=USE_CROSS_LEVEL_ATTN,
     ).to(device)
     print(f'ConvNeXt detection head: 4-level pyramid [P2,P3,P4,P5]  '
           f'OBB={"ENABLED" if USE_OBB else "DISABLED"}')
     print(f'  backbone={DINO_MODEL}  in_channels={CONVNEXT_IN_CHANNELS}')
     print(f'  AIFI={USE_AIFI} DFL={USE_DFL}(reg_max={DFL_REG_MAX}) '
           f'CTR={USE_CENTERNESS} DCN={USE_DCN} AUX={USE_AUX_DECODER}')
+    print(f'  [Phase D] FreqEnhance={USE_FREQ_ENHANCE} VarReg={VAR_REG_WEIGHT} '
+          f'CPD={CPD_WEIGHT}(warmup={CPD_WARMUP_EPOCHS})')
+    print(f'  [Phase E] CosineClassifier={COSINE_CLS} '
+          f'FocalWarmup={FOCAL_WARMUP_EPOCHS}ep TAL_ALPHA_schedule={TAL_ALPHA_SCHEDULE} '
+          f'CrossLevelAttn={USE_CROSS_LEVEL_ATTN}')
 
     # ── Backbone freeze (ConvNeXt always frozen for now) ────────────────────
     for p_ in dino_backbone.parameters():
@@ -723,14 +774,43 @@ def main():
           f'cls_coco={sum(p_.numel() for p_ in model_head.coco_cls_params())/1e6:.2f} M, '
           f'cls_neubie={sum(p_.numel() for p_ in model_head.neubie_cls_params())/1e6:.2f} M)')
 
+    # ── DataParallel wrapping ──────────────────────────────────────────────
+    # Keep raw references for param groups / EMA / checkpoint;
+    # use _dp_* wrappers in forward passes only.
+    model_head_raw    = model_head
+    dino_backbone_raw = dino_backbone
+    if len(gpu_ids) > 1:
+        dino_backbone = torch.nn.DataParallel(dino_backbone, device_ids=gpu_ids)
+        model_head    = torch.nn.DataParallel(model_head,    device_ids=gpu_ids)
+        print(f'  [DataParallel] backbone + head wrapped on GPUs {gpu_ids}')
+
+    # ── CPD prototype bank (Phase D) ───────────────────────────────────────
+    cpd_bank = None
+    if CPD_WEIGHT > 0:
+        from src.loss import CPDPrototypeBank
+        # cls_channels = 256 (same as FPN_CH for the cls tower)
+        cpd_feat_dim = FPN_CH  # cls tower output dim
+        cpd_bank = CPDPrototypeBank(
+            num_classes=actual_neubie_classes,
+            feat_dim=cpd_feat_dim,
+            momentum=CPD_MOMENTUM,
+            temperature=CPD_TEMPERATURE,
+        ).to(device)
+        print(f'CPD prototype bank: {actual_neubie_classes} classes, '
+              f'dim={cpd_feat_dim}, momentum={CPD_MOMENTUM}')
+
     # ── EMA ─────────────────────────────────────────────────────────────────
     ema: Optional[ModelEMA] = None
     if USE_EMA:
-        ema = ModelEMA(model_head, decay=EMA_DECAY, tau=EMA_TAU)
+        ema = ModelEMA(model_head_raw, decay=EMA_DECAY, tau=EMA_TAU)
         print(f'EMA enabled (head): decay={EMA_DECAY}, tau={EMA_TAU}')
 
-    # ── Calibration mode setup ─────────────────────────────────────────────
+    # ── Calibration / Fine-tuning mode setup ─────────────────────────────────
     CALIBRATE = args.calibrate
+    FINETUNE  = args.finetune
+    if CALIBRATE and FINETUNE:
+        raise ValueError('--calibrate and --finetune are mutually exclusive')
+
     if CALIBRATE:
         if not args.resume:
             raise ValueError('--calibrate requires --resume to load a pre-trained checkpoint')
@@ -740,14 +820,38 @@ def main():
               f'epochs={args.calibrate_epochs}')
         print('='*68 + '\n')
         # Freeze shared and coco params
-        for p_ in model_head.shared_params():
+        for p_ in model_head_raw.shared_params():
             p_.requires_grad = False
-        for p_ in model_head.coco_cls_params():
+        for p_ in model_head_raw.coco_cls_params():
             p_.requires_grad = False
         # Override loss settings for calibration
         VFL_Q_FLOOR     = 0.0
         WEIGHT_REG      = 0.3
         AUX_LOSS_WEIGHT = 0.0
+
+    if FINETUNE:
+        if not args.resume:
+            raise ValueError('--finetune requires --resume to load a pre-trained checkpoint')
+        # Override loss settings: VFL_Q_FLOOR=0.0, scale cls/reg weights
+        VFL_Q_FLOOR     = 0.0
+        WEIGHT_REG      = WEIGHT_REG * args.reg_loss_scale
+        AUX_LOSS_WEIGHT = 0.0
+        # Freeze COCO cls (not needed for Neubie deployment)
+        for p_ in model_head_raw.coco_cls_params():
+            p_.requires_grad = False
+        ft_shared_count = sum(p_.numel() for p_ in model_head_raw.shared_params())
+        ft_neubie_count = sum(p_.numel() for p_ in model_head_raw.neubie_cls_params())
+        print('\n' + '='*68)
+        print('  FINETUNE MODE: unfreeze FPN + shared towers + cls_neubie')
+        print(f'  VFL_Q_FLOOR=0.0  finetune_lr={args.finetune_lr}  '
+              f'epochs={args.finetune_epochs}')
+        print(f'  cls_loss_scale={args.cls_loss_scale}  '
+              f'reg_loss_scale={args.reg_loss_scale}  '
+              f'WEIGHT_REG={WEIGHT_REG:.2f}')
+        print(f'  Trainable: shared+FPN={ft_shared_count/1e6:.2f}M  '
+              f'cls_neubie={ft_neubie_count/1e6:.2f}M  '
+              f'(coco cls FROZEN)')
+        print('='*68 + '\n')
 
     # ── AdamW with per-component LR ─────────────────────────────────────────
     CLS_WEIGHT_DECAY = float(getattr(cfg, 'CLS_WEIGHT_DECAY', 1e-5))
@@ -755,20 +859,32 @@ def main():
 
     if CALIBRATE:
         opt_groups = [
-            {'params': [p_ for p_ in model_head.neubie_cls_params() if p_.requires_grad],
+            {'params': [p_ for p_ in model_head_raw.neubie_cls_params() if p_.requires_grad],
              'lr': args.calibrate_lr,
              'name': 'cls_neubie', 'weight_decay': CLS_WEIGHT_DECAY},
         ]
         optimizer = optim.AdamW(opt_groups)
         print(f'AdamW (calibrate): LR_cls_neubie={args.calibrate_lr}, '
               f'CLS_WD={CLS_WEIGHT_DECAY}')
+    elif FINETUNE:
+        opt_groups = [
+            {'params': [p_ for p_ in model_head_raw.shared_params() if p_.requires_grad],
+             'lr': args.finetune_lr,
+             'name': 'shared',     'weight_decay': WEIGHT_DECAY},
+            {'params': [p_ for p_ in model_head_raw.neubie_cls_params() if p_.requires_grad],
+             'lr': args.finetune_lr,
+             'name': 'cls_neubie', 'weight_decay': CLS_WEIGHT_DECAY},
+        ]
+        optimizer = optim.AdamW(opt_groups)
+        print(f'AdamW (finetune): LR={args.finetune_lr}, WD={WEIGHT_DECAY}, '
+              f'CLS_WD={CLS_WEIGHT_DECAY}')
     else:
         opt_groups = [
-            {'params': model_head.shared_params(),     'lr': cfg.LR_SHARED,
+            {'params': model_head_raw.shared_params(),     'lr': cfg.LR_SHARED,
              'name': 'shared',     'weight_decay': WEIGHT_DECAY},
-            {'params': model_head.coco_cls_params(),   'lr': cfg.LR_CLS_COCO,
+            {'params': model_head_raw.coco_cls_params(),   'lr': cfg.LR_CLS_COCO,
              'name': 'cls_coco',   'weight_decay': CLS_WEIGHT_DECAY},
-            {'params': model_head.neubie_cls_params(), 'lr': cfg.LR_CLS_NEUBIE,
+            {'params': model_head_raw.neubie_cls_params(), 'lr': cfg.LR_CLS_NEUBIE,
              'name': 'cls_neubie', 'weight_decay': CLS_WEIGHT_DECAY},
         ]
         optimizer = optim.AdamW(opt_groups)
@@ -812,14 +928,14 @@ def main():
     start_epoch:  int   = 0
     best_val_loss: Optional[float] = None
     if args.resume:
-        # In calibration mode, load weights only — optimizer is fresh (different param groups)
-        resume_opt = None if CALIBRATE else optimizer
+        # In calibration/finetune mode, load weights only — optimizer is fresh (different param groups)
+        resume_opt = None if (CALIBRATE or FINETUNE) else optimizer
         start_epoch, best_val_loss, scaler_state, ema_restored = load_checkpoint(
-            args.resume, model_head=model_head, dino_backbone=dino_backbone,
+            args.resume, model_head=model_head_raw, dino_backbone=dino_backbone_raw,
             optimizer=resume_opt, ema=ema, map_location='cpu',
         )
-        if CALIBRATE:
-            # Reset best_val_loss so calibrated model competes from scratch
+        if CALIBRATE or FINETUNE:
+            # Reset best_val_loss so finetuned/calibrated model competes from scratch
             best_val_loss = None
         if use_amp and scaler_state is not None:
             try:
@@ -833,11 +949,15 @@ def main():
                 print(f'  [WARN] EMA state not found in checkpoint -- using fresh EMA')
         print(f'Resumed from {args.resume} @ epoch={start_epoch}')
 
-    # ── Calibration epoch override ────────────────────────────────────────
+    # ── Calibration / Fine-tune epoch override ──────────────────────────────
     if CALIBRATE:
         NUM_EPOCHS = start_epoch + args.calibrate_epochs
         print(f'Calibration: epochs {start_epoch+1} → {NUM_EPOCHS} '
               f'({args.calibrate_epochs} calibration epochs)')
+    elif FINETUNE:
+        NUM_EPOCHS = start_epoch + args.finetune_epochs
+        print(f'Fine-tune: epochs {start_epoch+1} → {NUM_EPOCHS} '
+              f'({args.finetune_epochs} fine-tune epochs)')
 
     global_step      = 0
     log_path         = os.path.join(run_dir, 'train_log.jsonl') if SAVE_MODEL else ''
@@ -852,14 +972,17 @@ def main():
                         'traffic_light_other', 'warning_light', 'neubie', 'ev_open',
                         'bollard', 'scooter'}
     prev_stage       = -1
-    trainable_params = [p_ for p_ in model_head.parameters() if p_.requires_grad]
+    trainable_params = [p_ for p_ in model_head_raw.parameters() if p_.requires_grad]
 
     # ── Training loop ───────────────────────────────────────────────────────
     for epoch in range(start_epoch, NUM_EPOCHS):
-        stage = 4 if CALIBRATE else get_stage(epoch, cfg)
+        stage = 4 if (CALIBRATE or FINETUNE) else get_stage(epoch, cfg)
 
         if stage != prev_stage:
-            if CALIBRATE:
+            if FINETUNE:
+                stage_desc = (f'FINETUNE: FPN+heads, VFL_Q_FLOOR=0.0, '
+                              f'cls×{args.cls_loss_scale} reg×{args.reg_loss_scale}')
+            elif CALIBRATE:
                 stage_desc = f'CALIBRATION fine-tuning (cls_neubie only, VFL_Q_FLOOR=0.0)'
             else:
                 stage_desc = {
@@ -879,19 +1002,25 @@ def main():
             prev_stage = stage
 
         # ── Per-epoch LR: warmup + cosine within stage ──────────────────────
-        if CALIBRATE:
-            cal_epoch = epoch - start_epoch
-            cal_total = args.calibrate_epochs
-            warmup_cal = min(3, cal_total // 2)
-            if cal_epoch < warmup_cal:
-                cal_lr = LR_MIN + (args.calibrate_lr - LR_MIN) * (cal_epoch + 1) / warmup_cal
+        if CALIBRATE or FINETUNE:
+            _ft_epoch = epoch - start_epoch
+            _ft_total = args.calibrate_epochs if CALIBRATE else args.finetune_epochs
+            _ft_peak  = args.calibrate_lr if CALIBRATE else args.finetune_lr
+            _ft_warmup = min(3, _ft_total // 2)
+            if _ft_epoch < _ft_warmup:
+                _ft_lr = LR_MIN + (_ft_peak - LR_MIN) * (_ft_epoch + 1) / _ft_warmup
             else:
-                progress = (cal_epoch - warmup_cal) / max(1, cal_total - warmup_cal)
-                cal_lr = LR_MIN + (args.calibrate_lr - LR_MIN) * 0.5 * (1.0 + math.cos(math.pi * progress))
+                _ft_progress = (_ft_epoch - _ft_warmup) / max(1, _ft_total - _ft_warmup)
+                _ft_lr = LR_MIN + (_ft_peak - LR_MIN) * 0.5 * (1.0 + math.cos(math.pi * _ft_progress))
             for pg in optimizer.param_groups:
-                pg['lr'] = cal_lr
-            current_lrs = {'shared': 0.0, 'cls_coco': 0.0, 'cls_neubie': cal_lr}
-            print(f'  LR (calibrate): cls_neubie={cal_lr:.2e}', flush=True)
+                pg['lr'] = _ft_lr
+            if CALIBRATE:
+                current_lrs = {'shared': 0.0, 'cls_coco': 0.0, 'cls_neubie': _ft_lr}
+                print(f'  LR (calibrate): cls_neubie={_ft_lr:.2e}', flush=True)
+            else:
+                current_lrs = {'shared': _ft_lr, 'cls_coco': 0.0, 'cls_neubie': _ft_lr}
+                print(f'  LR (finetune): shared={_ft_lr:.2e}  cls_neubie={_ft_lr:.2e}',
+                      flush=True)
         else:
             epoch_in_stage = epoch - STAGE_START[stage]
             current_lrs = {}
@@ -903,6 +1032,21 @@ def main():
             print(f'  LR: shared={current_lrs["shared"]:.2e}  '
                   f'cls_coco={current_lrs["cls_coco"]:.2e}  '
                   f'cls_neubie={current_lrs["cls_neubie"]:.2e}', flush=True)
+
+        # ── Phase E schedule info ──────────────────────────────────────────
+        if FOCAL_WARMUP_EPOCHS > 0 and not CALIBRATE and not FINETUNE:
+            _cls_mode = 'FOCAL' if epoch < FOCAL_WARMUP_EPOCHS else 'VFL'
+            if TAL_ALPHA_SCHEDULE:
+                if epoch < FOCAL_WARMUP_EPOCHS:
+                    _ep_alpha = 0.0
+                elif epoch < FOCAL_WARMUP_EPOCHS + 30:
+                    _ep_alpha = TAL_ALPHA * (epoch - FOCAL_WARMUP_EPOCHS) / 30.0
+                else:
+                    _ep_alpha = TAL_ALPHA
+            else:
+                _ep_alpha = TAL_ALPHA
+            print(f'  [Phase E] cls_loss={_cls_mode}  TAL_ALPHA={_ep_alpha:.3f}',
+                  flush=True)
 
         # ── Mosaic toggle ───────────────────────────────────────────────────
         use_mosaic_this_epoch = USE_MOSAIC and (epoch < NUM_EPOCHS - CLOSE_MOSAIC)
@@ -953,16 +1097,40 @@ def main():
 
             cls_w = neubie_class_weights if dataset_tag == 'neubie' else coco_class_weights
 
+            # CPD: always collect features for prototype update (from epoch 0),
+            # but only apply contrastive loss after warmup (prototypes need to
+            # stabilize first — applying loss on random prototypes hurts).
+            # Also need cls_feat when VAR_REG_WEIGHT > 0 for full MARD.
+            _need_cls_feat = ((CPD_WEIGHT > 0 or VAR_REG_WEIGHT > 0)
+                              and dataset_tag == 'neubie')
+            _cpd_w = CPD_WEIGHT if (_need_cls_feat and epoch >= CPD_WARMUP_EPOCHS) else 0.0
+
+            # Phase E: Two-stage schedule — focal (hard targets) then VFL (soft)
+            _use_focal_warmup = (FOCAL_WARMUP_EPOCHS > 0
+                                 and epoch < FOCAL_WARMUP_EPOCHS
+                                 and not CALIBRATE and not FINETUNE)
+            # TAL_ALPHA ramp: 0.0 during focal warmup, linear ramp over next 30
+            if TAL_ALPHA_SCHEDULE and not CALIBRATE and not FINETUNE:
+                if epoch < FOCAL_WARMUP_EPOCHS:
+                    _tal_alpha = 0.0
+                elif epoch < FOCAL_WARMUP_EPOCHS + 30:
+                    _tal_alpha = TAL_ALPHA * (epoch - FOCAL_WARMUP_EPOCHS) / 30.0
+                else:
+                    _tal_alpha = TAL_ALPHA
+            else:
+                _tal_alpha = TAL_ALPHA
+
             optimizer.zero_grad(set_to_none=True)
             with autocast(device_type='cuda', enabled=use_amp):
                 feats   = dino_backbone(images)
-                outputs = model_head(feats, dataset=dataset_tag)
+                outputs = model_head(feats, dataset=dataset_tag,
+                                     return_cls_feat=_need_cls_feat)
                 strides = compute_strides(images, outputs)
                 loss    = compute_loss(
                     outputs, boxes, labels, images.shape[2:], strides,
                     FOCAL_ALPHA, FOCAL_GAMMA, WEIGHT_REG, WEIGHT_CTR,
                     weight_angle=WEIGHT_ANGLE,
-                    tal_topk=TAL_TOPK, tal_alpha=TAL_ALPHA, tal_beta=TAL_BETA,
+                    tal_topk=TAL_TOPK, tal_alpha=_tal_alpha, tal_beta=TAL_BETA,
                     epoch=epoch, num_epochs=NUM_EPOCHS,
                     prog_loss_epochs=PROG_LOSS_EPOCHS,
                     class_weights=cls_w,
@@ -972,7 +1140,18 @@ def main():
                     reg_max=DFL_REG_MAX,
                     use_centerness=USE_CENTERNESS,
                     aux_loss_weight=AUX_LOSS_WEIGHT if dataset_tag == 'neubie' else 0.0,
+                    var_reg_weight=VAR_REG_WEIGHT if dataset_tag == 'neubie' else 0.0,
+                    cpd_weight=_cpd_w,
+                    cpd_bank=cpd_bank,
+                    use_focal_warmup=_use_focal_warmup,
                 )
+
+            # In finetune mode, scale cls loss up to prioritize score recalibration
+            if FINETUNE and args.cls_loss_scale != 1.0:
+                total, cls_l, reg_l, ctr_l, ang_l = loss
+                # Recompute total: scale cls component
+                total = args.cls_loss_scale * cls_l + (total - cls_l)
+                loss = (total, cls_l, reg_l, ctr_l, ang_l)
 
             scaler.scale(loss[0]).backward()
             scaler.unscale_(optimizer)
@@ -981,7 +1160,7 @@ def main():
             scaler.update()
 
             if ema is not None:
-                ema.update(model_head)
+                ema.update(model_head_raw)
 
             train_loss_sum += float(loss[0].item())
             train_count    += 1
@@ -991,7 +1170,7 @@ def main():
                global_step % args.save_every_steps == 0:
                 save_checkpoint(
                     path=os.path.join(run_dir, 'last.pth'), epoch=epoch,
-                    model_head=model_head, dino_backbone=dino_backbone,
+                    model_head=model_head_raw, dino_backbone=dino_backbone_raw,
                     optimizer=optimizer, cfg_dict=cfg_dict, best_val_loss=best_val_loss,
                     scaler_state=scaler.state_dict() if use_amp else None,
                     ema_state=ema.state_dict() if ema else None,
@@ -1002,7 +1181,7 @@ def main():
         train_time     = time.time() - t0
 
         # ── Validation on Neubie val set ────────────────────────────────────
-        eval_head = ema.ema if ema is not None else model_head
+        eval_head = ema.ema if ema is not None else model_head_raw
         eval_head.eval()
         model_head.eval()
 
@@ -1138,7 +1317,7 @@ def main():
 
             save_checkpoint(
                 path=os.path.join(run_dir, 'last.pth'), epoch=epoch,
-                model_head=model_head, dino_backbone=dino_backbone,
+                model_head=model_head_raw, dino_backbone=dino_backbone_raw,
                 optimizer=optimizer, cfg_dict=cfg_dict, best_val_loss=best_val_loss,
                 scaler_state=scaler_state, ema_state=ema_state,
                 ema_full_state=ema_full_state,
@@ -1146,22 +1325,24 @@ def main():
 
             save_every = args.save_every_epochs
             if save_every > 0 and (epoch + 1) % save_every == 0:
-                snap_sd = ema_state if ema else model_head.state_dict()
+                snap_sd = ema_state if ema else model_head_raw.state_dict()
                 torch.save({'epoch': epoch, 'model_head': snap_sd, 'stage': stage},
                            os.path.join(run_dir, f'model_e{epoch+1:03d}.pth'))
                 print(f'  [CKPT] saved model_e{epoch+1:03d}.pth', flush=True)
 
-            past_warmup = CALIBRATE or (epoch >= cfg.STAGE2_END + PROG_LOSS_EPOCHS - 1)
+            past_warmup = CALIBRATE or FINETUNE or (epoch >= cfg.STAGE2_END + PROG_LOSS_EPOCHS - 1)
             if past_warmup:
                 if BEST_METRIC == 'f1':
                     if val_macro_f1 is not None:
                         cur_score   = val_macro_f1
                         is_new_best = (best_val_loss is None or cur_score > best_val_loss)
-                        best_name = 'best_calibrated.pth' if CALIBRATE else 'best.pth'
+                        best_name = ('best_calibrated.pth' if CALIBRATE
+                                     else 'best_finetuned.pth' if FINETUNE
+                                     else 'best.pth')
                         if is_new_best:
                             best_val_loss    = cur_score
                             patience_counter = 0
-                            best_sd  = ema_state if ema else model_head.state_dict()
+                            best_sd  = ema_state if ema else model_head_raw.state_dict()
                             best_ckpt = {
                                 'epoch':         epoch,
                                 'model_head':    best_sd,
@@ -1172,7 +1353,9 @@ def main():
                             }
                             torch.save(best_ckpt, os.path.join(run_dir, best_name))
                             torch.save(best_sd, os.path.join(run_dir, f'best_e{epoch+1:03d}.pth'))
-                            label = 'CALIBRATED' if CALIBRATE else 'EMA neubie'
+                            label = ('CALIBRATED' if CALIBRATE
+                                         else 'FINETUNED' if FINETUNE
+                                         else 'EMA neubie')
                             print(f'  [CKPT] * NEW BEST ({label} {BEST_METRIC}) = '
                                   f'{best_val_loss:.6f}  -> {best_name}', flush=True)
                         else:
@@ -1182,11 +1365,13 @@ def main():
                 else:
                     cur_score   = val_loss_avg
                     is_new_best = (best_val_loss is None or cur_score < best_val_loss)
-                    best_name = 'best_calibrated.pth' if CALIBRATE else 'best.pth'
+                    best_name = ('best_calibrated.pth' if CALIBRATE
+                                     else 'best_finetuned.pth' if FINETUNE
+                                     else 'best.pth')
                     if is_new_best:
                         best_val_loss    = cur_score
                         patience_counter = 0
-                        best_sd  = ema_state if ema else model_head.state_dict()
+                        best_sd  = ema_state if ema else model_head_raw.state_dict()
                         best_ckpt = {
                             'epoch':         epoch,
                             'model_head':    best_sd,
@@ -1197,7 +1382,9 @@ def main():
                         }
                         torch.save(best_ckpt, os.path.join(run_dir, best_name))
                         torch.save(best_sd, os.path.join(run_dir, f'best_e{epoch+1:03d}.pth'))
-                        label = 'CALIBRATED' if CALIBRATE else 'EMA neubie'
+                        label = ('CALIBRATED' if CALIBRATE
+                                         else 'FINETUNED' if FINETUNE
+                                         else 'EMA neubie')
                         print(f'  [CKPT] * NEW BEST ({label} {BEST_METRIC}) = '
                               f'{best_val_loss:.6f}  -> {best_name}', flush=True)
                     else:
@@ -1224,7 +1411,7 @@ def main():
             with open(log_path, 'a') as f:
                 f.write(json.dumps(rec) + '\n')
 
-        past_warmup_es = CALIBRATE or (epoch >= cfg.STAGE2_END + PROG_LOSS_EPOCHS - 1)
+        past_warmup_es = CALIBRATE or FINETUNE or (epoch >= cfg.STAGE2_END + PROG_LOSS_EPOCHS - 1)
         if past_warmup_es and args.patience > 0 and patience_counter >= args.patience:
             print(f'Early stopping (patience={args.patience}).', flush=True)
             break

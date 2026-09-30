@@ -27,7 +27,15 @@ mix_p2 (stride-8 P2 level + Phase C, ViT-S/16+)  <-- mAP@50=0.6262
  |
  v-- dropped last 3 ViT-S+ runs: low scores, evaluation plateau
  |
-convnext (ConvNeXt-S/B backbone)  <-- ACTIVE: need fast FPS + high performance
+convnext (ConvNeXt-S/B backbone)  <-- fast FPS + native multi-scale
+ |
+ v-- Phase E: head overhaul (Conv2d cls, cross-attn, DCN, VFL schedule, aux decoder)
+ |
+convnext Phase E  <-- BEST: mAP@50=0.7388, mAP@50:95=0.4810
+ |
+ v-- TRT deployment: GN→BN, DCN→Conv2d for TensorRT INT8
+ |
+convnext TRT fine-tune  <-- ACTIVE: 15-epoch fine-tune, ready to launch
 ```
 
 ## Why Each Transition Happened
@@ -39,6 +47,8 @@ convnext (ConvNeXt-S/B backbone)  <-- ACTIVE: need fast FPS + high performance
 | v3 | mix | Single-dataset training underutilizes COCO's 80-class diversity. Dual-classifier enables COCO transfer to Neubie. |
 | mix | mix_p2 | mAP@50 plateaued at 0.53. Small objects (traffic lights, bollard, scooter) need stride-8 resolution. Phase C adds DFL/DCN/AuxDecoder. |
 | mix_p2 (ViT-S+) | convnext | **Last 3 ViT-S+ runs showed low scores and evaluation plateau.** ConvNeXt offers native multi-scale (stride 8/16/32 built-in, no artificial resampling), faster FPS, and higher performance ceiling. |
+| convnext | convnext Phase E | CosineConv2d limited per-class learning. Added cross-level attention, DCN, VFL schedule, aux decoder. mAP@50 jumped from ~0.53 to 0.74. |
+| convnext Phase E | TRT fine-tune | GroupNorm + DCNv2 block TensorRT INT8 deployment. Replaced with BatchNorm + standard Conv2d, 15-epoch fine-tune to recover. |
 
 ## Key Metrics Progression
 
@@ -49,8 +59,12 @@ convnext (ConvNeXt-S/B backbone)  <-- ACTIVE: need fast FPS + high performance
 | v3 (120 ep) | ~0.40* | ~0.28* | — | Completed, archived |
 | mix (250 ep) | 0.5289 | 0.3346 | 0.6919 | Best ViT baseline |
 | mix_p2 (80 ep) | 0.6262 | 0.3915 | — | Completed |
-| convnext-small | — | — | 0.435 | Training (ep 180/180) |
-| convnext-base | — | — | — | Training (ep 157/180) |
+| convnext-small (initial) | — | — | 0.435 | Completed |
+| convnext-base (initial) | — | — | 0.443 | Completed |
+| **Phase E small (E110)** | **0.7388** | **0.4810** | **0.4576** | **Completed (ES@E140)** |
+| **Phase E base (E90)** | **0.7302** | **0.4714** | **0.4630** | **Completed (ES@E120)** |
+| TRT fine-tune small | — | — | — | Ready to launch |
+| TRT fine-tune base | — | — | — | Ready to launch |
 
 *Estimated from loss curves; no formal COCO-style eval was run on v2/v3.
 
@@ -63,7 +77,8 @@ convnext (ConvNeXt-S/B backbone)  <-- ACTIVE: need fast FPS + high performance
 | [03_v3_multi_depth.md](03_v3_multi_depth.md) | v3 | Multi-depth FPN + VFL |
 | [04_mix_dual_classifier.md](04_mix_dual_classifier.md) | mix | Dual-classifier, 4-stage curriculum, best ViT baseline |
 | [05_mix_p2_stride8.md](05_mix_p2_stride8.md) | mix_p2 | P2 stride-8, Phase C improvements |
-| [06_convnext.md](06_convnext.md) | convnext | ConvNeXt backbone, active experiments |
+| [06_convnext.md](06_convnext.md) | convnext | ConvNeXt backbone, initial experiments |
+| [07_phaseE_trt_finetune.md](07_phaseE_trt_finetune.md) | convnext Phase E + TRT | Phase E training results, bug fixes, TRT-clean head, fine-tune setup (Sep 1-28) |
 
 ## 16 Neubie Classes (fixed order)
 
